@@ -41,6 +41,21 @@ html, body {
   justify-content: space-between;
 }
 
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topbar-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex-shrink: 0;
+  display: block;
+}
+
 .topbar h1 {
   font-size: 18px;
   margin: 0;
@@ -244,6 +259,15 @@ textarea {
   justify-content: center;
   padding: 24px;
 }
+.login-logo-img {
+  width: 84px;
+  height: 84px;
+  border-radius: 20px;
+  display: block;
+  margin: 0 auto 16px;
+  box-shadow: 0 10px 24px rgba(31, 77, 53, 0.25);
+}
+
 .login-logo {
   text-align: center;
   font-size: 28px;

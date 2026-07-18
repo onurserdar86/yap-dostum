@@ -123,6 +123,7 @@ async function renderLogin() {
 
   root.innerHTML = `
     <div class="login-wrap">
+      <img src="logo.svg" alt="Yap-Dostum" class="login-logo-img">
       <div class="login-logo">Yap<span>-</span>Dostum</div>
       <div class="login-tag">Haftalık checklist ve görev takip uygulaması</div>
       <div class="card">
@@ -152,6 +153,7 @@ async function renderLogin() {
 async function renderFirstSetup() {
   root.innerHTML = `
     <div class="login-wrap">
+      <img src="logo.svg" alt="Yap-Dostum" class="login-logo-img">
       <div class="login-logo">Yap<span>-</span>Dostum</div>
       <div class="login-tag">İlk kurulum — Admin hesabı oluştur</div>
       <div class="card">
@@ -194,9 +196,12 @@ async function renderFirstSetup() {
 function topbar(title, sub) {
   return `
     <div class="topbar">
-      <div>
-        <h1>${escapeHtml(title)}</h1>
-        ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}
+      <div class="topbar-left">
+        <img src="logo.svg" alt="Yap-Dostum" class="topbar-logo">
+        <div>
+          <h1>${escapeHtml(title)}</h1>
+          ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}
+        </div>
       </div>
       <button class="btn btn-ghost btn-sm" id="logout-btn">Çıkış</button>
     </div>
