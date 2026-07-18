@@ -309,7 +309,12 @@ async function renderOwner() {
   `;
   wireLogout();
   document.querySelectorAll(".tab-btn").forEach(b => {
-    b.onclick = () => { ownerTab = b.getAttribute("data-tab"); renderOwner(); };
+    b.onclick = () => {
+      const newTab = b.getAttribute("data-tab");
+      if (newTab !== "checklists") renderOwnerChecklists._editing = null;
+      ownerTab = newTab;
+      renderOwner();
+    };
   });
 
   if (ownerTab === "friends") await renderOwnerFriends();
@@ -397,6 +402,46 @@ async function fetchOwnerItemsAll() {
   return list;
 }
 
+// Bir checklist'i düzenlerken: checklist dokümanını günceller; görevlerde ise
+// (gün+metin) aynı kalanları KORUYARAK (böylece geçmiş işaretlemeleri kaybolmaz)
+// güncelleştirir, yeni eklenenleri oluşturur, kaldırılanları siler.
+async function saveChecklistEdit(checklistId, existingItems, formData) {
+  const { title, assignedTo, startDate, endDate, itemsToCreate } = formData;
+
+  await updateDoc(doc(db, "checklists", checklistId), { title, assignedTo, startDate, endDate });
+
+  const existingByKey = new Map();
+  existingItems.forEach(it => {
+    const key = `${it.day}|${it.text}`;
+    if (!existingByKey.has(key)) existingByKey.set(key, it);
+  });
+
+  const desiredKeys = new Set();
+  const ops = [];
+  itemsToCreate.forEach(desired => {
+    const key = `${desired.day}|${desired.text}`;
+    desiredKeys.add(key);
+    const existing = existingByKey.get(key);
+    if (existing) {
+      ops.push(updateDoc(doc(db, "items", existing.id), {
+        order: desired.order, assignedTo, startDate, endDate, active: true,
+      }));
+    } else {
+      ops.push(addDoc(collection(db, "items"), {
+        checklistId, ownerId: currentUser.uid, assignedTo,
+        day: desired.day, text: desired.text, order: desired.order, active: true,
+        startDate, endDate,
+      }));
+    }
+  });
+  existingItems.forEach(it => {
+    const key = `${it.day}|${it.text}`;
+    if (!desiredKeys.has(key)) ops.push(deleteDoc(doc(db, "items", it.id)));
+  });
+
+  await Promise.all(ops);
+}
+
 async function renderOwnerChecklists() {
   const body = document.getElementById("owner-body");
   body.innerHTML = `<div class="empty">Yükleniyor…</div>`;
@@ -413,26 +458,28 @@ async function renderOwnerChecklists() {
   });
 
   const today = formatDateLocal(new Date());
+  const editing = renderOwnerChecklists._editing || null; // null = yeni oluşturma modu
+  const editingItems = editing ? (itemsByChecklist[editing.id] || []) : [];
 
   body.innerHTML = `
     <div class="card">
-      <h2>Yeni Checklist Oluştur</h2>
+      <h2>${editing ? "Checklisti Düzenle" : "Yeni Checklist Oluştur"}</h2>
       ${friends.length ? "" : `<div class="hint">Önce "Dostlarım" sekmesinden en az bir dost eklemelisin.</div>`}
       <div id="new-checklist-form" style="${friends.length ? "" : "display:none"}">
         <label>Başlık</label>
-        <input type="text" id="cl-title" placeholder="Örn: Ev İşleri Haftalık">
+        <input type="text" id="cl-title" placeholder="Örn: Ev İşleri Haftalık" value="${editing ? escapeHtml(editing.title) : ""}">
         <label>Kimin için</label>
         <select id="cl-assignee">
-          ${friends.map(f => `<option value="${f.uid}">${escapeHtml(f.displayName)}</option>`).join("")}
+          ${friends.map(f => `<option value="${f.uid}" ${editing && editing.assignedTo === f.uid ? "selected" : ""}>${escapeHtml(f.displayName)}</option>`).join("")}
         </select>
         <div class="row">
           <div>
             <label>Başlangıç Tarihi</label>
-            <input type="date" id="cl-start" value="${today}">
+            <input type="date" id="cl-start" value="${editing ? editing.startDate : today}">
           </div>
           <div>
             <label>Bitiş Tarihi (opsiyonel)</label>
-            <input type="date" id="cl-end">
+            <input type="date" id="cl-end" value="${editing && editing.endDate ? editing.endDate : ""}">
           </div>
         </div>
         <div class="hint">Bitiş tarihini boş bırakırsan checklist süresiz devam eder.</div>
@@ -443,7 +490,10 @@ async function renderOwnerChecklists() {
         <button type="button" class="btn btn-outline btn-sm mt8" id="cl-add-row">+ Görev Ekle</button>
 
         <div class="error-text" id="cl-error"></div>
-        <button class="btn btn-primary btn-block mt16" id="cl-submit">Checklisti Kaydet</button>
+        <div class="row mt16">
+          ${editing ? `<button type="button" class="btn btn-outline" id="cl-cancel">İptal</button>` : ""}
+          <button class="btn btn-primary" id="cl-submit">${editing ? "Güncelle" : "Checklisti Kaydet"}</button>
+        </div>
       </div>
     </div>
     <div class="card">
@@ -454,8 +504,27 @@ async function renderOwnerChecklists() {
 
   if (friends.length) {
     const rowsWrap = document.getElementById("cl-task-rows");
-    addTaskRow(rowsWrap); // başlangıçta bir satır ile başla
+    if (editing) {
+      const byOrder = {};
+      editingItems.forEach(it => {
+        const key = it.order ?? 0;
+        if (!byOrder[key]) byOrder[key] = { text: it.text, days: [] };
+        byOrder[key].days.push(it.day);
+      });
+      const rows = Object.keys(byOrder).sort((a, b) => a - b).map(k => byOrder[k]);
+      if (rows.length) rows.forEach(r => addTaskRow(rowsWrap, r));
+      else addTaskRow(rowsWrap);
+    } else {
+      addTaskRow(rowsWrap); // başlangıçta bir satır ile başla
+    }
     document.getElementById("cl-add-row").onclick = () => addTaskRow(rowsWrap);
+
+    if (editing) {
+      document.getElementById("cl-cancel").onclick = () => {
+        renderOwnerChecklists._editing = null;
+        renderOwnerChecklists();
+      };
+    }
 
     document.getElementById("cl-submit").onclick = async () => {
       const title = document.getElementById("cl-title").value.trim();
@@ -481,15 +550,20 @@ async function renderOwnerChecklists() {
       if (!itemsToCreate.length) { errEl.textContent = "En az bir görev ekle ve en az bir gün seç."; return; }
 
       try {
-        const clRef = await addDoc(collection(db, "checklists"), {
-          ownerId: currentUser.uid, assignedTo, title,
-          startDate, endDate, active: true, createdAt: serverTimestamp(),
-        });
-        await Promise.all(itemsToCreate.map(it => addDoc(collection(db, "items"), {
-          checklistId: clRef.id, ownerId: currentUser.uid, assignedTo,
-          day: it.day, text: it.text, order: it.order, active: true,
-          startDate, endDate,
-        })));
+        if (editing) {
+          await saveChecklistEdit(editing.id, editingItems, { title, assignedTo, startDate, endDate, itemsToCreate });
+          renderOwnerChecklists._editing = null;
+        } else {
+          const clRef = await addDoc(collection(db, "checklists"), {
+            ownerId: currentUser.uid, assignedTo, title,
+            startDate, endDate, active: true, createdAt: serverTimestamp(),
+          });
+          await Promise.all(itemsToCreate.map(it => addDoc(collection(db, "items"), {
+            checklistId: clRef.id, ownerId: currentUser.uid, assignedTo,
+            day: it.day, text: it.text, order: it.order, active: true,
+            startDate, endDate,
+          })));
+        }
         await renderOwnerChecklists();
       } catch (e) {
         errEl.textContent = friendlyError(e);
@@ -511,10 +585,17 @@ async function renderOwnerChecklists() {
           <div class="meta">${friend ? escapeHtml(friend.displayName) : "?"} · ${items.length} görev · ${dateRange}</div>
           <div class="meta"><span class="badge ${cl.active === false ? "inactive" : ""}">${cl.active === false ? "Pasif" : "Aktif"}</span></div>
         </div>
-        <button class="btn btn-outline btn-sm" data-id="${cl.id}" data-active="${cl.active !== false}">${cl.active === false ? "Aktifleştir" : "Pasifleştir"}</button>
+        <div class="row-actions">
+          <button class="btn btn-outline btn-sm" data-edit="${cl.id}">Düzenle</button>
+          <button class="btn btn-outline btn-sm" data-id="${cl.id}" data-active="${cl.active !== false}">${cl.active === false ? "Aktifleştir" : "Pasifleştir"}</button>
+        </div>
       </div>
     `);
-    row.querySelector("button").onclick = async (e) => {
+    row.querySelector("[data-edit]").onclick = () => {
+      renderOwnerChecklists._editing = cl;
+      renderOwnerChecklists();
+    };
+    row.querySelector("[data-id]").onclick = async (e) => {
       const id = e.target.getAttribute("data-id");
       const isActive = e.target.getAttribute("data-active") === "true";
       await updateDoc(doc(db, "checklists", id), { active: !isActive });
@@ -525,16 +606,22 @@ async function renderOwnerChecklists() {
 }
 
 // Checklist formunda bir "görev satırı" ekler: metin girişi + gün seçim rozetleri.
-function addTaskRow(container) {
+// initial = {text, days:[...]} verilirse (düzenleme modu) satır o değerlerle önceden doldurulur;
+// verilmezse (yeni checklist) tüm günler otomatik seçili gelir.
+function addTaskRow(container, initial) {
+  const presetDays = initial ? initial.days : null;
   const row = el(`
     <div class="task-input-block">
       <div class="item-input-row">
-        <input type="text" class="ti-text" placeholder="Görev metni (örn: Bulaşıkları yıka)">
+        <input type="text" class="ti-text" placeholder="Görev metni (örn: Bulaşıkları yıka)" value="${initial ? escapeHtml(initial.text) : ""}">
         <button type="button" class="icon-btn ti-remove" title="Sil">✕</button>
       </div>
       <div class="day-chip-row">
-        ${DAY_SHORT.map((d, i) => `<button type="button" class="day-chip selected" data-day="${i}">${d}</button>`).join("")}
-        <button type="button" class="day-chip day-chip-all selected" data-all="1">Tümü</button>
+        ${DAY_SHORT.map((d, i) => {
+          const sel = presetDays ? presetDays.includes(i) : true;
+          return `<button type="button" class="day-chip ${sel ? "selected" : ""}" data-day="${i}">${d}</button>`;
+        }).join("")}
+        <button type="button" class="day-chip day-chip-all" data-all="1">Tümü</button>
       </div>
     </div>
   `);
@@ -554,6 +641,7 @@ function addTaskRow(container) {
     dayBtns.forEach(b => b.classList.toggle("selected", shouldSelect));
     allBtn.classList.toggle("selected", shouldSelect);
   };
+  syncAllBtn();
 
   container.appendChild(row);
   row.querySelector(".ti-text").focus();
@@ -734,7 +822,7 @@ async function renderFriend() {
 // AUTH DURUM DİNLEYİCİ
 // ============================================================
 onAuthStateChanged(auth, async (fbUser) => {
-  if (!fbUser) { currentUser = null; ownerFriendsCache = null; renderLogin(); return; }
+  if (!fbUser) { currentUser = null; ownerFriendsCache = null; renderOwnerChecklists._editing = null; renderLogin(); return; }
   const udoc = await getUserDoc(fbUser.uid);
   if (!udoc) { await signOut(auth); return; }
   if (udoc.active === false) {
