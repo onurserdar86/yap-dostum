@@ -1,0 +1,77 @@
+rules_version = '2';
+
+// Bu içeriği Firebase Console > Firestore Database > Rules sekmesine
+// olduğu gibi yapıştır ve "Yayınla / Publish" butonuna bas.
+// KURULUM-REHBERI.docx içinde adım adım anlatılıyor.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function myUid() { return request.auth.uid; }
+    function myDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function myRole() { return myDoc().data.role; }
+    function isActive() { return myDoc().data.active != false; }
+
+    // İlk kurulumun tamamlanıp tamamlanmadığını kontrol için kullanılan kayıt
+    match /meta/setup {
+      allow read: if true;
+      allow create: if isSignedIn() && !exists(/databases/$(database)/documents/meta/setup);
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && (
+        myUid() == uid ||
+        myRole() == 'admin' ||
+        (myRole() == 'owner' && resource.data.ownerId == myUid())
+      );
+
+      // Uygulamada hiç admin yokken: kişinin kendi hesabını "admin" olarak oluşturması (tek seferlik ilk kurulum)
+      allow create: if isSignedIn() && myUid() == uid
+                    && request.resource.data.role == 'admin'
+                    && !exists(/databases/$(database)/documents/meta/setup);
+
+      // Admin -> yeni Sahip kullanıcı oluşturur
+      allow create: if isSignedIn() && myRole() == 'admin' && isActive()
+                    && request.resource.data.role == 'owner';
+
+      // Sahip -> kendi Dost kullanıcısını oluşturur
+      allow create: if isSignedIn() && myRole() == 'owner' && isActive()
+                    && request.resource.data.role == 'friend'
+                    && request.resource.data.ownerId == myUid();
+
+      // Aktif/pasif değiştirme (rol ve sahiplik değiştirilemez)
+      allow update: if isSignedIn() && (
+        (myRole() == 'admin' && resource.data.role == 'owner') ||
+        (myRole() == 'owner' && resource.data.role == 'friend' && resource.data.ownerId == myUid())
+      )
+      && request.resource.data.role == resource.data.role
+      && request.resource.data.ownerId == resource.data.ownerId;
+
+      allow delete: if false;
+    }
+
+    match /checklists/{id} {
+      allow read: if isSignedIn() && (resource.data.ownerId == myUid() || resource.data.assignedTo == myUid());
+      allow create: if isSignedIn() && myRole() == 'owner' && isActive() && request.resource.data.ownerId == myUid();
+      allow update, delete: if isSignedIn() && resource.data.ownerId == myUid();
+    }
+
+    match /items/{id} {
+      allow read: if isSignedIn() && (resource.data.ownerId == myUid() || resource.data.assignedTo == myUid());
+      allow create: if isSignedIn() && myRole() == 'owner' && isActive() && request.resource.data.ownerId == myUid();
+      allow update, delete: if isSignedIn() && resource.data.ownerId == myUid();
+    }
+
+    match /completions/{id} {
+      allow read: if isSignedIn() && (resource.data.ownerId == myUid() || resource.data.assignedTo == myUid());
+      allow create, update: if isSignedIn() && (
+        request.resource.data.assignedTo == myUid() ||
+        request.resource.data.ownerId == myUid()
+      );
+      allow delete: if false;
+    }
+  }
+}
