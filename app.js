@@ -27,6 +27,7 @@ function getSecondaryAuth() {
 
 // ---------- Sabitler ----------
 const DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"];
+const DAY_SHORT = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"];
 const root = document.getElementById("app");
 
 let currentUser = null; // {uid, username, displayName, role, ownerId, active}
@@ -34,6 +35,11 @@ let currentUser = null; // {uid, username, displayName, role, ownerId, active}
 // ---------- Yardımcılar ----------
 function pad(n) { return n.toString().padStart(2, "0"); }
 function formatDateLocal(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function formatTRDate(dateStr) {
+  if (!dateStr) return "";
+  const [y, m, d] = dateStr.split("-");
+  return `${d}.${m}.${y}`;
+}
 function todayDayIndex(d = new Date()) { return (d.getDay() + 6) % 7; } // 0=Pzt ... 6=Paz
 function addDays(dateStr, n) {
   const d = new Date(dateStr + "T00:00:00");
@@ -63,6 +69,13 @@ function friendlyError(e) {
     "auth/too-many-requests": "Çok fazla deneme yapıldı, biraz sonra tekrar dene.",
   };
   return map[code] || (e && e.message) || "Bir hata oluştu.";
+}
+// Bir görevin (item) verilen tarihte geçerli olup olmadığını checklist'in
+// başlangıç/bitiş tarihine göre kontrol eder.
+function inRange(item, dateStr) {
+  if (item.startDate && dateStr < item.startDate) return false;
+  if (item.endDate && dateStr > item.endDate) return false;
+  return true;
 }
 
 // ---------- Firestore yardımcıları ----------
@@ -271,7 +284,14 @@ async function loadOwnerList() {
 // SAHİP (OWNER) GÖRÜNÜMÜ
 // ============================================================
 let ownerTab = "friends";
-let ownerFriendsCache = [];
+let ownerFriendsCache = null; // null = henüz yüklenmedi
+
+async function ensureFriendsLoaded(force = false) {
+  if (force || ownerFriendsCache === null) {
+    ownerFriendsCache = await listUsersByRole("friend", currentUser.uid);
+  }
+  return ownerFriendsCache;
+}
 
 async function renderOwner() {
   root.innerHTML = topbar("Yap-Dostum · Sahip", currentUser.displayName) + `
@@ -280,14 +300,12 @@ async function renderOwner() {
       <button class="tab-btn ${ownerTab === "checklists" ? "active" : ""}" data-tab="checklists">Checklistler</button>
       <button class="tab-btn ${ownerTab === "tracking" ? "active" : ""}" data-tab="tracking">Takip</button>
     </div>
-    <div class="container" id="owner-body"></div>
+    <div class="container" id="owner-body"><div class="empty">Yükleniyor…</div></div>
   `;
   wireLogout();
   document.querySelectorAll(".tab-btn").forEach(b => {
     b.onclick = () => { ownerTab = b.getAttribute("data-tab"); renderOwner(); };
   });
-
-  ownerFriendsCache = await listUsersByRole("friend", currentUser.uid);
 
   if (ownerTab === "friends") await renderOwnerFriends();
   else if (ownerTab === "checklists") await renderOwnerChecklists();
@@ -296,6 +314,7 @@ async function renderOwner() {
 
 async function renderOwnerFriends() {
   const body = document.getElementById("owner-body");
+  const friends = await ensureFriendsLoaded();
   body.innerHTML = `
     <div class="card">
       <h2>Yeni Dost Ekle</h2>
@@ -310,7 +329,7 @@ async function renderOwnerFriends() {
     </div>
     <div class="card">
       <h2>Dostlarım</h2>
-      <div id="friend-list" class="empty">Yükleniyor…</div>
+      <div id="friend-list" class="empty">${friends.length ? "" : "Henüz dost eklemedin."}</div>
     </div>
   `;
   document.getElementById("nf-submit").onclick = async () => {
@@ -324,7 +343,7 @@ async function renderOwnerFriends() {
     }
     try {
       await createManagedUser({ username, password, displayName, role: "friend", ownerId: currentUser.uid });
-      ownerFriendsCache = await listUsersByRole("friend", currentUser.uid);
+      await ensureFriendsLoaded(true);
       await renderOwnerFriends();
     } catch (e) {
       errEl.textContent = friendlyError(e);
@@ -332,9 +351,9 @@ async function renderOwnerFriends() {
   };
 
   const listEl = document.getElementById("friend-list");
-  if (!ownerFriendsCache.length) { listEl.innerHTML = `<div class="empty">Henüz dost eklemedin.</div>`; return; }
+  if (!friends.length) return;
   listEl.innerHTML = "";
-  ownerFriendsCache.forEach(f => {
+  friends.forEach(f => {
     const row = el(`
       <div class="list-item">
         <div class="info">
@@ -348,7 +367,7 @@ async function renderOwnerFriends() {
       const uid = e.target.getAttribute("data-uid");
       const isActive = e.target.getAttribute("data-active") === "true";
       await updateDoc(doc(db, "users", uid), { active: !isActive });
-      ownerFriendsCache = await listUsersByRole("friend", currentUser.uid);
+      await ensureFriendsLoaded(true);
       await renderOwnerFriends();
     };
     listEl.appendChild(row);
@@ -363,76 +382,108 @@ async function fetchOwnerChecklists() {
   list.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
   return list;
 }
-async function fetchItemsForChecklist(checklistId) {
-  const q = query(collection(db, "items"), where("checklistId", "==", checklistId));
+// Sahibin TÜM görevlerini tek sorguda getirir (checklist başına ayrı sorgu yapmaktan
+// çok daha hızlıdır); sonuç checklistId'ye göre grupla.
+async function fetchOwnerItemsAll() {
+  const q = query(collection(db, "items"), where("ownerId", "==", currentUser.uid));
   const snap = await getDocs(q);
   const list = [];
   snap.forEach(d => list.push({ id: d.id, ...d.data() }));
-  list.sort((a, b) => a.day - b.day || (a.order || 0) - (b.order || 0));
   return list;
 }
 
 async function renderOwnerChecklists() {
   const body = document.getElementById("owner-body");
-  const checklists = await fetchOwnerChecklists();
+  body.innerHTML = `<div class="empty">Yükleniyor…</div>`;
+
+  const [friends, checklists, allItems] = await Promise.all([
+    ensureFriendsLoaded(),
+    fetchOwnerChecklists(),
+    fetchOwnerItemsAll(),
+  ]);
+
+  const itemsByChecklist = {};
+  allItems.forEach(it => {
+    (itemsByChecklist[it.checklistId] || (itemsByChecklist[it.checklistId] = [])).push(it);
+  });
+
+  const today = formatDateLocal(new Date());
+
   body.innerHTML = `
     <div class="card">
       <h2>Yeni Checklist Oluştur</h2>
-      ${ownerFriendsCache.length ? "" : `<div class="hint">Önce "Dostlarım" sekmesinden en az bir dost eklemelisin.</div>`}
-      <div id="new-checklist-form" style="${ownerFriendsCache.length ? "" : "display:none"}">
+      ${friends.length ? "" : `<div class="hint">Önce "Dostlarım" sekmesinden en az bir dost eklemelisin.</div>`}
+      <div id="new-checklist-form" style="${friends.length ? "" : "display:none"}">
         <label>Başlık</label>
         <input type="text" id="cl-title" placeholder="Örn: Ev İşleri Haftalık">
         <label>Kimin için</label>
         <select id="cl-assignee">
-          ${ownerFriendsCache.map(f => `<option value="${f.uid}">${escapeHtml(f.displayName)}</option>`).join("")}
+          ${friends.map(f => `<option value="${f.uid}">${escapeHtml(f.displayName)}</option>`).join("")}
         </select>
-        <div id="cl-days"></div>
+        <div class="row">
+          <div>
+            <label>Başlangıç Tarihi</label>
+            <input type="date" id="cl-start" value="${today}">
+          </div>
+          <div>
+            <label>Bitiş Tarihi (opsiyonel)</label>
+            <input type="date" id="cl-end">
+          </div>
+        </div>
+        <div class="hint">Bitiş tarihini boş bırakırsan checklist süresiz devam eder.</div>
+
+        <label class="mt16">Görevler</label>
+        <div class="hint">Her görev için hangi günler geçerli olacağını seç. Yeni eklenen görevlerde tüm günler otomatik seçilir, istemediğin günleri kaldırabilirsin.</div>
+        <div id="cl-task-rows" class="mt8"></div>
+        <button type="button" class="btn btn-outline btn-sm mt8" id="cl-add-row">+ Görev Ekle</button>
+
         <div class="error-text" id="cl-error"></div>
         <button class="btn btn-primary btn-block mt16" id="cl-submit">Checklisti Kaydet</button>
       </div>
     </div>
     <div class="card">
       <h2>Checklistlerim</h2>
-      <div id="checklist-list" class="empty">Yükleniyor…</div>
+      <div id="checklist-list" class="empty">${checklists.length ? "" : "Henüz checklist yok."}</div>
     </div>
   `;
 
-  if (ownerFriendsCache.length) {
-    const daysWrap = document.getElementById("cl-days");
-    DAYS.forEach((dayName, idx) => {
-      const group = el(`
-        <div class="day-group">
-          <div class="day-title">${dayName}</div>
-          <div class="item-rows" data-day="${idx}"></div>
-          <button type="button" class="btn btn-outline btn-sm" data-add-day="${idx}">+ Görev ekle</button>
-        </div>
-      `);
-      daysWrap.appendChild(group);
-      group.querySelector("[data-add-day]").onclick = () => addItemInputRow(group.querySelector(".item-rows"));
-    });
+  if (friends.length) {
+    const rowsWrap = document.getElementById("cl-task-rows");
+    addTaskRow(rowsWrap); // başlangıçta bir satır ile başla
+    document.getElementById("cl-add-row").onclick = () => addTaskRow(rowsWrap);
 
     document.getElementById("cl-submit").onclick = async () => {
       const title = document.getElementById("cl-title").value.trim();
       const assignedTo = document.getElementById("cl-assignee").value;
+      const startDate = document.getElementById("cl-start").value;
+      const endDate = document.getElementById("cl-end").value || null;
       const errEl = document.getElementById("cl-error");
       errEl.textContent = "";
-      const itemsToCreate = [];
-      document.querySelectorAll(".item-rows").forEach(rowsEl => {
-        const day = parseInt(rowsEl.getAttribute("data-day"), 10);
-        rowsEl.querySelectorAll("input").forEach((inp, order) => {
-          const text = inp.value.trim();
-          if (text) itemsToCreate.push({ day, text, order });
-        });
-      });
+
       if (!title) { errEl.textContent = "Başlık gerekli."; return; }
-      if (!itemsToCreate.length) { errEl.textContent = "En az bir gün için görev ekle."; return; }
+      if (!startDate) { errEl.textContent = "Başlangıç tarihi gerekli."; return; }
+      if (endDate && endDate < startDate) { errEl.textContent = "Bitiş tarihi başlangıçtan önce olamaz."; return; }
+
+      const itemsToCreate = [];
+      document.querySelectorAll("#cl-task-rows .task-input-block").forEach((rowEl, idx) => {
+        const text = rowEl.querySelector(".ti-text").value.trim();
+        const days = Array.from(rowEl.querySelectorAll(".day-chip:not(.day-chip-all).selected"))
+          .map(b => parseInt(b.getAttribute("data-day"), 10));
+        if (text && days.length) {
+          days.forEach(day => itemsToCreate.push({ day, text, order: idx }));
+        }
+      });
+      if (!itemsToCreate.length) { errEl.textContent = "En az bir görev ekle ve en az bir gün seç."; return; }
+
       try {
         const clRef = await addDoc(collection(db, "checklists"), {
-          ownerId: currentUser.uid, assignedTo, title, active: true, createdAt: serverTimestamp(),
+          ownerId: currentUser.uid, assignedTo, title,
+          startDate, endDate, active: true, createdAt: serverTimestamp(),
         });
         await Promise.all(itemsToCreate.map(it => addDoc(collection(db, "items"), {
           checklistId: clRef.id, ownerId: currentUser.uid, assignedTo,
           day: it.day, text: it.text, order: it.order, active: true,
+          startDate, endDate,
         })));
         await renderOwnerChecklists();
       } catch (e) {
@@ -442,16 +493,18 @@ async function renderOwnerChecklists() {
   }
 
   const listEl = document.getElementById("checklist-list");
-  if (!checklists.length) { listEl.innerHTML = `<div class="empty">Henüz checklist yok.</div>`; return; }
+  if (!checklists.length) return;
   listEl.innerHTML = "";
-  for (const cl of checklists) {
-    const friend = ownerFriendsCache.find(f => f.uid === cl.assignedTo);
-    const items = await fetchItemsForChecklist(cl.id);
+  checklists.forEach(cl => {
+    const friend = friends.find(f => f.uid === cl.assignedTo);
+    const items = itemsByChecklist[cl.id] || [];
+    const dateRange = `${formatTRDate(cl.startDate)} – ${cl.endDate ? formatTRDate(cl.endDate) : "Süresiz"}`;
     const row = el(`
       <div class="list-item">
         <div class="info">
           <div class="name">${escapeHtml(cl.title)}</div>
-          <div class="meta">${friend ? escapeHtml(friend.displayName) : "?"} · ${items.length} görev · <span class="badge ${cl.active === false ? "inactive" : ""}">${cl.active === false ? "Pasif" : "Aktif"}</span></div>
+          <div class="meta">${friend ? escapeHtml(friend.displayName) : "?"} · ${items.length} görev · ${dateRange}</div>
+          <div class="meta"><span class="badge ${cl.active === false ? "inactive" : ""}">${cl.active === false ? "Pasif" : "Aktif"}</span></div>
         </div>
         <button class="btn btn-outline btn-sm" data-id="${cl.id}" data-active="${cl.active !== false}">${cl.active === false ? "Aktifleştir" : "Pasifleştir"}</button>
       </div>
@@ -463,19 +516,42 @@ async function renderOwnerChecklists() {
       await renderOwnerChecklists();
     };
     listEl.appendChild(row);
-  }
+  });
 }
 
-function addItemInputRow(container) {
+// Checklist formunda bir "görev satırı" ekler: metin girişi + gün seçim rozetleri.
+function addTaskRow(container) {
   const row = el(`
-    <div class="item-input-row">
-      <input type="text" placeholder="Görev metni">
-      <button type="button" class="icon-btn" title="Sil">✕</button>
+    <div class="task-input-block">
+      <div class="item-input-row">
+        <input type="text" class="ti-text" placeholder="Görev metni (örn: Bulaşıkları yıka)">
+        <button type="button" class="icon-btn ti-remove" title="Sil">✕</button>
+      </div>
+      <div class="day-chip-row">
+        ${DAY_SHORT.map((d, i) => `<button type="button" class="day-chip selected" data-day="${i}">${d}</button>`).join("")}
+        <button type="button" class="day-chip day-chip-all selected" data-all="1">Tümü</button>
+      </div>
     </div>
   `);
-  row.querySelector("button").onclick = () => row.remove();
+  row.querySelector(".ti-remove").onclick = () => row.remove();
+
+  const allBtn = row.querySelector(".day-chip-all");
+  const dayBtns = Array.from(row.querySelectorAll(".day-chip:not(.day-chip-all)"));
+  function syncAllBtn() {
+    const allSelected = dayBtns.every(b => b.classList.contains("selected"));
+    allBtn.classList.toggle("selected", allSelected);
+  }
+  dayBtns.forEach(b => {
+    b.onclick = () => { b.classList.toggle("selected"); syncAllBtn(); };
+  });
+  allBtn.onclick = () => {
+    const shouldSelect = !allBtn.classList.contains("selected");
+    dayBtns.forEach(b => b.classList.toggle("selected", shouldSelect));
+    allBtn.classList.toggle("selected", shouldSelect);
+  };
+
   container.appendChild(row);
-  row.querySelector("input").focus();
+  row.querySelector(".ti-text").focus();
 }
 
 // ---- Sahip: Takip sekmesi ----
@@ -486,20 +562,22 @@ async function renderOwnerTracking() {
   renderOwnerTracking._date = selectedDate;
   renderOwnerTracking._friend = selectedFriend;
 
+  const friends = await ensureFriendsLoaded();
+
   body.innerHTML = `
     <div class="card">
       <h2>Günlük Takip</h2>
       <label>Dost</label>
       <select id="tr-friend">
         <option value="all">Tümü</option>
-        ${ownerFriendsCache.map(f => `<option value="${f.uid}" ${f.uid === selectedFriend ? "selected" : ""}>${escapeHtml(f.displayName)}</option>`).join("")}
+        ${friends.map(f => `<option value="${f.uid}" ${f.uid === selectedFriend ? "selected" : ""}>${escapeHtml(f.displayName)}</option>`).join("")}
       </select>
       <div class="date-nav mt16">
         <button class="btn btn-outline btn-sm" id="tr-prev">‹ Önceki Gün</button>
         <input type="date" id="tr-date" value="${selectedDate}">
         <button class="btn btn-outline btn-sm" id="tr-next">Sonraki Gün ›</button>
       </div>
-      <div id="tr-results" class="mt16"></div>
+      <div id="tr-results" class="mt16"><div class="empty">Yükleniyor…</div></div>
     </div>
   `;
   document.getElementById("tr-friend").onchange = (e) => { renderOwnerTracking._friend = e.target.value; renderOwnerTracking(); };
@@ -508,34 +586,40 @@ async function renderOwnerTracking() {
   document.getElementById("tr-next").onclick = () => { renderOwnerTracking._date = addDays(selectedDate, 1); renderOwnerTracking(); };
 
   const resultsEl = document.getElementById("tr-results");
-  resultsEl.innerHTML = `<div class="empty">Yükleniyor…</div>`;
 
   const dateObj = new Date(selectedDate + "T00:00:00");
   const dayIdx = todayDayIndex(dateObj);
 
-  const friendsToShow = selectedFriend === "all" ? ownerFriendsCache : ownerFriendsCache.filter(f => f.uid === selectedFriend);
+  const friendsToShow = selectedFriend === "all" ? friends : friends.filter(f => f.uid === selectedFriend);
   if (!friendsToShow.length) { resultsEl.innerHTML = `<div class="empty">Gösterilecek dost yok.</div>`; return; }
 
-  resultsEl.innerHTML = "";
-  for (const friend of friendsToShow) {
+  // Her dost için görev + tamamlanma sorgularını paralel çalıştır (sırayla beklemek yerine).
+  const blocks = await Promise.all(friendsToShow.map(async (friend) => {
     const itemsQ = query(collection(db, "items"),
       where("ownerId", "==", currentUser.uid),
       where("assignedTo", "==", friend.uid),
       where("day", "==", dayIdx),
       where("active", "==", true));
-    const itemsSnap = await getDocs(itemsQ);
-    const items = [];
-    itemsSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
-    items.sort((a, b) => (a.order || 0) - (b.order || 0));
-
     const compQ = query(collection(db, "completions"),
       where("ownerId", "==", currentUser.uid),
       where("assignedTo", "==", friend.uid),
       where("date", "==", selectedDate));
-    const compSnap = await getDocs(compQ);
+
+    const [itemsSnap, compSnap] = await Promise.all([getDocs(itemsQ), getDocs(compQ)]);
+
+    let items = [];
+    itemsSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    items = items.filter(it => inRange(it, selectedDate));
+    items.sort((a, b) => (a.order || 0) - (b.order || 0));
+
     const doneMap = {};
     compSnap.forEach(d => { const v = d.data(); doneMap[v.itemId] = !!v.done; });
 
+    return { friend, items, doneMap };
+  }));
+
+  resultsEl.innerHTML = "";
+  blocks.forEach(({ friend, items, doneMap }) => {
     const doneCount = items.filter(it => doneMap[it.id]).length;
     const pct = items.length ? Math.round((doneCount / items.length) * 100) : 0;
 
@@ -560,7 +644,7 @@ async function renderOwnerTracking() {
       block.appendChild(trow);
     });
     resultsEl.appendChild(block);
-  }
+  });
 }
 
 // ============================================================
@@ -600,8 +684,9 @@ async function renderFriend() {
     where("day", "==", dayIdx),
     where("active", "==", true));
   const itemsSnap = await getDocs(itemsQ);
-  const items = [];
+  let items = [];
   itemsSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  items = items.filter(it => inRange(it, selectedDate));
   items.sort((a, b) => (a.order || 0) - (b.order || 0));
 
   if (!items.length) { tasksEl.innerHTML = `<div class="empty">Bu gün için görevin yok. 🎉</div>`; return; }
@@ -644,7 +729,7 @@ async function renderFriend() {
 // AUTH DURUM DİNLEYİCİ
 // ============================================================
 onAuthStateChanged(auth, async (fbUser) => {
-  if (!fbUser) { currentUser = null; renderLogin(); return; }
+  if (!fbUser) { currentUser = null; ownerFriendsCache = null; renderLogin(); return; }
   const udoc = await getUserDoc(fbUser.uid);
   if (!udoc) { await signOut(auth); return; }
   if (udoc.active === false) {

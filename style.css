@@ -279,3 +279,41 @@ textarea {
   margin-bottom: 10px;
 }
 .date-nav .btn { padding: 8px 12px; }
+
+.task-input-block {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+}
+.task-input-block:last-child { border-bottom: none; margin-bottom: 0; }
+
+.day-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.day-chip {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 999px;
+  padding: 6px 11px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  color: var(--muted);
+}
+.day-chip.selected {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.day-chip-all {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.day-chip-all.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #2b2b2b;
+}
