@@ -78,6 +78,39 @@ function inRange(item, dateStr) {
   return true;
 }
 
+// ---------- Konum (Dost görev tamamlarken) ----------
+let locationPrimed = false;
+// Uygulamaya girer girmez konum iznini bir kez "ısıtır" (tarayıcı izin diyaloğunu erkenden gösterir),
+// böylece Dost bir görevi tamamlarken beklemeden konum alınabilir.
+function primeLocationPermission() {
+  if (locationPrimed || !("geolocation" in navigator)) return;
+  locationPrimed = true;
+  try {
+    navigator.geolocation.getCurrentPosition(() => {}, () => {}, { maximumAge: 300000, timeout: 5000 });
+  } catch (e) { /* yoksay */ }
+}
+function getCurrentLocationSafe(timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    if (!("geolocation" in navigator)) { resolve(null); return; }
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, timeoutMs);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy || null,
+        });
+      },
+      () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } },
+      { enableHighAccuracy: false, timeout: timeoutMs, maximumAge: 60000 }
+    );
+  });
+}
+
 // ---------- Firestore yardımcıları ----------
 async function getUserDoc(uid) {
   const snap = await getDoc(doc(db, "users", uid));
@@ -402,9 +435,16 @@ async function fetchOwnerItemsAll() {
   return list;
 }
 
+// Görev tekrarlayan mı (gün+metin) yoksa belirli bir tarihe mi (tarih+metin) bağlı,
+// buna göre benzersiz bir anahtar üretir. Düzenlerken aynı anahtara sahip görevler
+// KORUNUR (geçmiş işaretlemeleri kaybolmaz), farklı olanlar oluşturulur/silinir.
+function itemKey(it) {
+  const type = it.type === "specific" ? "specific" : "recurring";
+  return type === "specific" ? `specific|${it.date}|${it.text}` : `recurring|${it.day}|${it.text}`;
+}
+
 // Bir checklist'i düzenlerken: checklist dokümanını günceller; görevlerde ise
-// (gün+metin) aynı kalanları KORUYARAK (böylece geçmiş işaretlemeleri kaybolmaz)
-// güncelleştirir, yeni eklenenleri oluşturur, kaldırılanları siler.
+// aynı kalanları KORUYARAK günceller, yeni eklenenleri oluşturur, kaldırılanları siler.
 async function saveChecklistEdit(checklistId, existingItems, formData) {
   const { title, assignedTo, startDate, endDate, itemsToCreate } = formData;
 
@@ -412,30 +452,31 @@ async function saveChecklistEdit(checklistId, existingItems, formData) {
 
   const existingByKey = new Map();
   existingItems.forEach(it => {
-    const key = `${it.day}|${it.text}`;
+    const key = itemKey(it);
     if (!existingByKey.has(key)) existingByKey.set(key, it);
   });
 
   const desiredKeys = new Set();
   const ops = [];
   itemsToCreate.forEach(desired => {
-    const key = `${desired.day}|${desired.text}`;
+    const key = itemKey(desired);
     desiredKeys.add(key);
     const existing = existingByKey.get(key);
+    const updatePayload = desired.type === "specific"
+      ? { order: desired.order, assignedTo, active: true }
+      : { order: desired.order, assignedTo, startDate, endDate, active: true };
     if (existing) {
-      ops.push(updateDoc(doc(db, "items", existing.id), {
-        order: desired.order, assignedTo, startDate, endDate, active: true,
-      }));
+      ops.push(updateDoc(doc(db, "items", existing.id), updatePayload));
     } else {
       ops.push(addDoc(collection(db, "items"), {
-        checklistId, ownerId: currentUser.uid, assignedTo,
-        day: desired.day, text: desired.text, order: desired.order, active: true,
-        startDate, endDate,
+        checklistId, ownerId: currentUser.uid, assignedTo, type: desired.type,
+        text: desired.text, order: desired.order, active: true,
+        ...(desired.type === "specific" ? { date: desired.date } : { day: desired.day, startDate, endDate }),
       }));
     }
   });
   existingItems.forEach(it => {
-    const key = `${it.day}|${it.text}`;
+    const key = itemKey(it);
     if (!desiredKeys.has(key)) ops.push(deleteDoc(doc(db, "items", it.id)));
   });
 
@@ -485,7 +526,7 @@ async function renderOwnerChecklists() {
         <div class="hint">Bitiş tarihini boş bırakırsan checklist süresiz devam eder.</div>
 
         <label class="mt16">Görevler</label>
-        <div class="hint">Her görev için hangi günler geçerli olacağını seç. Yeni eklenen görevlerde tüm günler otomatik seçilir, istemediğin günleri kaldırabilirsin.</div>
+        <div class="hint">Her görev "Tekrarlayan" (belirli haftalık günlerde) veya "Belirli Tarih(ler)" (sadece seçtiğin takvim günlerinde) olabilir. Tekrarlayan görevlerde tüm günler otomatik seçilir, istemediğini kaldırabilirsin.</div>
         <div id="cl-task-rows" class="mt8"></div>
         <button type="button" class="btn btn-outline btn-sm mt8" id="cl-add-row">+ Görev Ekle</button>
 
@@ -508,8 +549,10 @@ async function renderOwnerChecklists() {
       const byOrder = {};
       editingItems.forEach(it => {
         const key = it.order ?? 0;
-        if (!byOrder[key]) byOrder[key] = { text: it.text, days: [] };
-        byOrder[key].days.push(it.day);
+        const type = it.type === "specific" ? "specific" : "recurring";
+        if (!byOrder[key]) byOrder[key] = { text: it.text, type, days: [], dates: [] };
+        if (type === "specific") byOrder[key].dates.push(it.date);
+        else byOrder[key].days.push(it.day);
       });
       const rows = Object.keys(byOrder).sort((a, b) => a - b).map(k => byOrder[k]);
       if (rows.length) rows.forEach(r => addTaskRow(rowsWrap, r));
@@ -541,13 +584,18 @@ async function renderOwnerChecklists() {
       const itemsToCreate = [];
       document.querySelectorAll("#cl-task-rows .task-input-block").forEach((rowEl, idx) => {
         const text = rowEl.querySelector(".ti-text").value.trim();
-        const days = Array.from(rowEl.querySelectorAll(".day-chip:not(.day-chip-all).selected"))
-          .map(b => parseInt(b.getAttribute("data-day"), 10));
-        if (text && days.length) {
-          days.forEach(day => itemsToCreate.push({ day, text, order: idx }));
+        if (!text) return;
+        const mode = rowEl.dataset.mode === "specific" ? "specific" : "recurring";
+        if (mode === "recurring") {
+          const days = Array.from(rowEl.querySelectorAll(".day-chip:not(.day-chip-all).selected"))
+            .map(b => parseInt(b.getAttribute("data-day"), 10));
+          days.forEach(day => itemsToCreate.push({ type: "recurring", day, text, order: idx }));
+        } else {
+          const dates = Array.from(rowEl.querySelectorAll(".date-chip")).map(c => c.getAttribute("data-date"));
+          dates.forEach(date => itemsToCreate.push({ type: "specific", date, text, order: idx }));
         }
       });
-      if (!itemsToCreate.length) { errEl.textContent = "En az bir görev ekle ve en az bir gün seç."; return; }
+      if (!itemsToCreate.length) { errEl.textContent = "En az bir görev ekle: tekrarlayan görevler için en az bir gün, belirli tarihli görevler için en az bir tarih seç."; return; }
 
       try {
         if (editing) {
@@ -559,9 +607,9 @@ async function renderOwnerChecklists() {
             startDate, endDate, active: true, createdAt: serverTimestamp(),
           });
           await Promise.all(itemsToCreate.map(it => addDoc(collection(db, "items"), {
-            checklistId: clRef.id, ownerId: currentUser.uid, assignedTo,
-            day: it.day, text: it.text, order: it.order, active: true,
-            startDate, endDate,
+            checklistId: clRef.id, ownerId: currentUser.uid, assignedTo, type: it.type,
+            text: it.text, order: it.order, active: true,
+            ...(it.type === "specific" ? { date: it.date } : { day: it.day, startDate, endDate }),
           })));
         }
         await renderOwnerChecklists();
@@ -605,28 +653,77 @@ async function renderOwnerChecklists() {
   });
 }
 
-// Checklist formunda bir "görev satırı" ekler: metin girişi + gün seçim rozetleri.
-// initial = {text, days:[...]} verilirse (düzenleme modu) satır o değerlerle önceden doldurulur;
-// verilmezse (yeni checklist) tüm günler otomatik seçili gelir.
+// Bir görev satırının "belirli tarih" alanına yeni bir tarih çipi ekler (aynı tarih tekrar eklenmez).
+function addDateChip(container, dateStr) {
+  if (!dateStr) return;
+  const already = Array.from(container.querySelectorAll(".date-chip")).some(c => c.getAttribute("data-date") === dateStr);
+  if (already) return;
+  const chip = el(`
+    <span class="date-chip" data-date="${dateStr}">
+      ${formatTRDate(dateStr)}
+      <button type="button" class="date-chip-remove">✕</button>
+    </span>
+  `);
+  chip.querySelector(".date-chip-remove").onclick = () => chip.remove();
+  container.appendChild(chip);
+}
+
+// Checklist formunda bir "görev satırı" ekler: metin girişi + tekrarlayan/belirli tarih seçimi.
+// initial = {text, type, days:[...], dates:[...]} verilirse (düzenleme modu) satır o değerlerle
+// önceden doldurulur; verilmezse (yeni checklist) tekrarlayan mod + tüm günler seçili gelir.
 function addTaskRow(container, initial) {
-  const presetDays = initial ? initial.days : null;
+  const mode = initial && initial.type === "specific" ? "specific" : "recurring";
+  const presetDays = initial && mode === "recurring" ? initial.days : null;
+  const presetDates = initial && mode === "specific" ? initial.dates : [];
+
   const row = el(`
-    <div class="task-input-block">
+    <div class="task-input-block" data-mode="${mode}">
       <div class="item-input-row">
         <input type="text" class="ti-text" placeholder="Görev metni (örn: Bulaşıkları yıka)" value="${initial ? escapeHtml(initial.text) : ""}">
         <button type="button" class="icon-btn ti-remove" title="Sil">✕</button>
       </div>
-      <div class="day-chip-row">
-        ${DAY_SHORT.map((d, i) => {
-          const sel = presetDays ? presetDays.includes(i) : true;
-          return `<button type="button" class="day-chip ${sel ? "selected" : ""}" data-day="${i}">${d}</button>`;
-        }).join("")}
-        <button type="button" class="day-chip day-chip-all" data-all="1">Tümü</button>
+
+      <div class="mode-toggle">
+        <button type="button" class="mode-btn ${mode === "recurring" ? "active" : ""}" data-mode-btn="recurring">Tekrarlayan</button>
+        <button type="button" class="mode-btn ${mode === "specific" ? "active" : ""}" data-mode-btn="specific">Belirli Tarih(ler)</button>
+      </div>
+
+      <div class="recurring-ui" style="${mode === "specific" ? "display:none" : ""}">
+        <div class="day-chip-row">
+          ${DAY_SHORT.map((d, i) => {
+            const sel = presetDays ? presetDays.includes(i) : true;
+            return `<button type="button" class="day-chip ${sel ? "selected" : ""}" data-day="${i}">${d}</button>`;
+          }).join("")}
+          <button type="button" class="day-chip day-chip-all" data-all="1">Tümü</button>
+        </div>
+      </div>
+
+      <div class="specific-ui" style="${mode === "recurring" ? "display:none" : ""}">
+        <div class="date-chip-row"></div>
+        <div class="item-input-row">
+          <input type="date" class="ti-date-input">
+          <button type="button" class="btn btn-outline btn-sm ti-date-add">+ Ekle</button>
+        </div>
       </div>
     </div>
   `);
   row.querySelector(".ti-remove").onclick = () => row.remove();
 
+  // Mod geçişi (Tekrarlayan <-> Belirli Tarih)
+  const modeBtns = row.querySelectorAll(".mode-btn");
+  const recurringUi = row.querySelector(".recurring-ui");
+  const specificUi = row.querySelector(".specific-ui");
+  modeBtns.forEach(b => {
+    b.onclick = () => {
+      const m = b.getAttribute("data-mode-btn");
+      row.dataset.mode = m;
+      modeBtns.forEach(x => x.classList.toggle("active", x === b));
+      recurringUi.style.display = m === "recurring" ? "" : "none";
+      specificUi.style.display = m === "specific" ? "" : "none";
+    };
+  });
+
+  // Tekrarlayan (gün rozetleri)
   const allBtn = row.querySelector(".day-chip-all");
   const dayBtns = Array.from(row.querySelectorAll(".day-chip:not(.day-chip-all)"));
   function syncAllBtn() {
@@ -642,6 +739,14 @@ function addTaskRow(container, initial) {
     allBtn.classList.toggle("selected", shouldSelect);
   };
   syncAllBtn();
+
+  // Belirli tarih(ler)
+  const dateChipRow = row.querySelector(".date-chip-row");
+  (presetDates || []).forEach(d => addDateChip(dateChipRow, d));
+  row.querySelector(".ti-date-add").onclick = () => {
+    const inp = row.querySelector(".ti-date-input");
+    if (inp.value) { addDateChip(dateChipRow, inp.value); inp.value = ""; }
+  };
 
   container.appendChild(row);
   row.querySelector(".ti-text").focus();
@@ -687,33 +792,40 @@ async function renderOwnerTracking() {
   if (!friendsToShow.length) { resultsEl.innerHTML = `<div class="empty">Gösterilecek dost yok.</div>`; return; }
 
   // Her dost için görev + tamamlanma sorgularını paralel çalıştır (sırayla beklemek yerine).
+  // Görevler iki türde olabilir: tekrarlayan (day == dayIdx) veya belirli tarih (date == selectedDate).
   const blocks = await Promise.all(friendsToShow.map(async (friend) => {
-    const itemsQ = query(collection(db, "items"),
+    const recurringQ = query(collection(db, "items"),
       where("ownerId", "==", currentUser.uid),
       where("assignedTo", "==", friend.uid),
       where("day", "==", dayIdx),
+      where("active", "==", true));
+    const specificQ = query(collection(db, "items"),
+      where("ownerId", "==", currentUser.uid),
+      where("assignedTo", "==", friend.uid),
+      where("date", "==", selectedDate),
       where("active", "==", true));
     const compQ = query(collection(db, "completions"),
       where("ownerId", "==", currentUser.uid),
       where("assignedTo", "==", friend.uid),
       where("date", "==", selectedDate));
 
-    const [itemsSnap, compSnap] = await Promise.all([getDocs(itemsQ), getDocs(compQ)]);
+    const [recSnap, specSnap, compSnap] = await Promise.all([getDocs(recurringQ), getDocs(specificQ), getDocs(compQ)]);
 
     let items = [];
-    itemsSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    recSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    specSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
     items = items.filter(it => inRange(it, selectedDate));
     items.sort((a, b) => (a.order || 0) - (b.order || 0));
 
-    const doneMap = {};
-    compSnap.forEach(d => { const v = d.data(); doneMap[v.itemId] = !!v.done; });
+    const compMap = {};
+    compSnap.forEach(d => { const v = d.data(); compMap[v.itemId] = v; });
 
-    return { friend, items, doneMap };
+    return { friend, items, compMap };
   }));
 
   resultsEl.innerHTML = "";
-  blocks.forEach(({ friend, items, doneMap }) => {
-    const doneCount = items.filter(it => doneMap[it.id]).length;
+  blocks.forEach(({ friend, items, compMap }) => {
+    const doneCount = items.filter(it => compMap[it.id] && compMap[it.id].done).length;
     const pct = items.length ? Math.round((doneCount / items.length) * 100) : 0;
 
     const block = el(`
@@ -727,11 +839,14 @@ async function renderOwnerTracking() {
       </div>
     `);
     items.forEach(it => {
-      const done = !!doneMap[it.id];
+      const comp = compMap[it.id];
+      const done = !!(comp && comp.done);
+      const loc = comp && comp.location;
       const trow = el(`
         <div class="task-row">
           <div class="check ${done ? "done" : ""}">${done ? "✓" : ""}</div>
-          <div class="task-text ${done ? "done" : ""}">${escapeHtml(it.text)}</div>
+          <div class="task-text ${done ? "done" : ""}">${escapeHtml(it.text)}${it.type === "specific" ? ` <span class="hint">(${formatTRDate(it.date)})</span>` : ""}</div>
+          ${done && loc ? `<a class="loc-link" href="https://www.google.com/maps?q=${loc.lat},${loc.lng}" target="_blank" rel="noopener" title="Tamamlandığı andaki konum">📍</a>` : ""}
         </div>
       `);
       block.appendChild(trow);
@@ -764,21 +879,29 @@ async function renderFriend() {
         </div>
         <div id="fr-tasks" class="mt16"><div class="empty">Yükleniyor…</div></div>
         ${!isToday ? `<div class="hint mt16">Geçmiş/gelecek günlerde işaretleme yapılamaz, sadece bugünkü görevler işaretlenebilir.</div>` : ""}
+        ${isToday ? `<div class="hint mt16">Bir görevi tamamlandı işaretlediğinde, tarayıcın izin verirse o anki konumun Sahibine gösterilir.</div>` : ""}
       </div>
     </div>
   `;
   wireLogout();
+  primeLocationPermission();
   document.getElementById("fr-prev").onclick = () => { renderFriend._date = addDays(selectedDate, -1); renderFriend(); };
   document.getElementById("fr-next").onclick = () => { renderFriend._date = addDays(selectedDate, 1); renderFriend(); };
 
   const tasksEl = document.getElementById("fr-tasks");
-  const itemsQ = query(collection(db, "items"),
+  // Görevler iki türde olabilir: tekrarlayan (day == dayIdx) veya belirli tarih (date == selectedDate).
+  const recurringQ = query(collection(db, "items"),
     where("assignedTo", "==", currentUser.uid),
     where("day", "==", dayIdx),
     where("active", "==", true));
-  const itemsSnap = await getDocs(itemsQ);
+  const specificQ = query(collection(db, "items"),
+    where("assignedTo", "==", currentUser.uid),
+    where("date", "==", selectedDate),
+    where("active", "==", true));
+  const [recSnap, specSnap] = await Promise.all([getDocs(recurringQ), getDocs(specificQ)]);
   let items = [];
-  itemsSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  recSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
+  specSnap.forEach(d => items.push({ id: d.id, ...d.data() }));
   items = items.filter(it => inRange(it, selectedDate));
   items.sort((a, b) => (a.order || 0) - (b.order || 0));
 
@@ -797,7 +920,7 @@ async function renderFriend() {
     const row = el(`
       <div class="task-row">
         <div class="check ${done ? "done" : ""}" data-item="${it.id}">${done ? "✓" : ""}</div>
-        <div class="task-text ${done ? "done" : ""}">${escapeHtml(it.text)}</div>
+        <div class="task-text ${done ? "done" : ""}">${escapeHtml(it.text)}${it.type === "specific" ? ` <span class="hint">(${formatTRDate(it.date)})</span>` : ""}</div>
       </div>
     `);
     if (isToday) {
@@ -809,7 +932,14 @@ async function renderFriend() {
           itemId, ownerId: it.ownerId, assignedTo: currentUser.uid,
           date: selectedDate, done: newDone, completedAt: serverTimestamp(),
         }, { merge: true });
-        renderFriend();
+        renderFriend(); // anında güncelle; konum arka planda ayrıca eklenir
+
+        if (newDone) {
+          const loc = await getCurrentLocationSafe();
+          if (loc) {
+            await setDoc(doc(db, "completions", `${itemId}_${selectedDate}`), { location: loc }, { merge: true });
+          }
+        }
       };
     } else {
       row.querySelector(".check").style.opacity = "0.6";

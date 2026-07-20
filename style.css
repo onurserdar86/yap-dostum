@@ -221,6 +221,64 @@ textarea {
 .task-text { flex: 1; font-size: 15px; }
 .task-text.done { text-decoration: line-through; color: var(--muted); }
 
+.loc-link {
+  text-decoration: none;
+  font-size: 17px;
+  padding: 2px 4px;
+  flex-shrink: 0;
+}
+
+.mode-toggle {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0;
+}
+.mode-btn {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 10px;
+  padding: 8px 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  cursor: pointer;
+}
+.mode-btn.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.date-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.date-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #eef3ee;
+  color: var(--primary);
+  border-radius: 999px;
+  padding: 5px 6px 5px 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.date-chip-remove {
+  border: none;
+  background: rgba(0,0,0,0.08);
+  color: inherit;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
 .day-group { margin-bottom: 6px; }
 .day-title {
   font-size: 12px;
